@@ -1,105 +1,186 @@
-# 📁 UI/app.py
+"""
+Application Streamlit moderne pour RAG Q&A et génération de quiz
+"""
 
 import streamlit as st
-from pathlib import Path
-import tempfile
-
-# Ajouter le projet à sys.path
 import sys
+from pathlib import Path
+import time
+
+# Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from core.intelligent_processor import IntelligentDocumentProcessor
-from core.semantic_chunker import SemanticChunker
-from core.hybrid_retriever import CourseRetriever
-from core.quiz_generator import QuizGenerator
+from scripts.rag_pipeline import run_rag_pipeline
+from core.quiz_generator import run_quiz_pipeline, QUESTION_TYPES
+from UI.streamlit_utils import apply_custom_css, init_session_state, save_uploaded_pdf
+from UI.quiz_handler import display_quiz_interface
 
+# ==================== PAGE CONFIG ====================
 st.set_page_config(
-    page_title="StudyBuddy",
-    layout="wide"
+    page_title="RAG Assistant & Quiz Generator",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-st.title("📚 StudyBuddy - RAG Assistant pour PDF")
-st.markdown("Upload un PDF, explore son contenu, génère des quiz et pose des questions !")
+# ==================== CUSTOM CSS ====================
+apply_custom_css()
 
-# --------------------------------------------
-# Section 1 : Upload du PDF
-# --------------------------------------------
-uploaded_file = st.file_uploader("📄 Choisir un fichier PDF", type=["pdf"])
+# ==================== SESSION STATE ====================
+init_session_state()
 
-if uploaded_file:
-    # Créer un fichier temporaire pour traiter le PDF
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        pdf_path = tmp_file.name
+# ==================== HEADER ====================
+st.markdown("""
+    <div class="main-header">
+        <h1> StudyBuddy:RAG Assistant & Quiz Generator</h1>
+        <p>Posez vos questions ou générez un quiz interactif depuis vos documents PDF</p>
+    </div>
+""", unsafe_allow_html=True)
+
+# ==================== SIDEBAR - PDF UPLOAD ====================
+with st.sidebar:
+    st.markdown("###  Gestion des Documents")
     
-    st.success(f"✅ PDF chargé : {uploaded_file.name}")
-
-    # --------------------------------------------
-    # Section 2 : Analyse et chunking
-    # --------------------------------------------
-    st.header("1️⃣ Analyse du PDF")
-    processor = IntelligentDocumentProcessor(model="phi3:mini")
-    with st.spinner("Analyse du document..."):
-        doc_understanding = processor.process_pdf(pdf_path)
+    uploaded_file = st.file_uploader(
+        "Importer un PDF",
+        type=["pdf"],
+        help="Importez votre document PDF pour commencer"
+    )
     
-    st.subheader("Résumé du document")
-    st.write(f"**Titre** : {doc_understanding.title}")
-    st.write(f"**Type** : {doc_understanding.document_type}")
-    st.write(f"**Langue** : {doc_understanding.language}")
-    st.write(f"**Concepts principaux** : {', '.join(doc_understanding.main_concepts[:5])}")
-    st.write(f"**Sections détectées** : {len(doc_understanding.structure)}")
-
-    st.header("2️⃣ Chunking sémantique")
-    chunker = SemanticChunker(min_words=50, max_words=200)
-    chunks = chunker.chunk_document(doc_understanding)
-    st.write(f"Nombre de chunks créés : {len(chunks)}")
-    for i, chunk in enumerate(chunks[:3]):
-        st.markdown(f"**Chunk {i+1}** : Section: {chunk['section'][:50]}, Concept: {chunk['main_concept'][:50]}")
-        st.write(chunk['content'][:200] + "…")
-    if len(chunks) > 3:
-        st.info(f"... et {len(chunks) - 3} autres chunks")
-
-    # --------------------------------------------
-    # Section 3 : Indexation vectorielle
-    # --------------------------------------------
-    st.header("3️⃣ Indexation et RAG")
-    retriever = CourseRetriever(model_name="phi3:mini")
-    with st.spinner("Indexation vectorielle en cours..."):
-        retriever.index_course(
-            chunks=chunks,
-            course_title=doc_understanding.title,
-            main_concepts=doc_understanding.main_concepts
-        )
-    st.success("Indexation terminée ✅")
-
-    # --------------------------------------------
-    # Section 4 : Posez vos questions
-    # --------------------------------------------
-    st.header("4️⃣ Posez une question")
-    user_query = st.text_input("Votre question :", "")
+    if uploaded_file:
+        pdf_path = save_uploaded_pdf(uploaded_file)
+        st.session_state.current_pdf = pdf_path
+        st.success(f" PDF chargé: {uploaded_file.name}")
     
-    if user_query:
-        with st.spinner("Recherche de réponse..."):
-            answer = retriever.answer_question(user_query, context_size=3)
-        st.subheader("Réponse")
-        st.write(answer['answer'])
-        st.write(f"**Confiance** : {answer['confidence']:.2f}")
-        st.write(f"**Sources utilisées** : {len(answer['sources'])} chunks")
-
-    # --------------------------------------------
-    # Section 5 : Génération de quiz
-    # --------------------------------------------
-    st.header("5️⃣ Générer un quiz")
-    if st.button("🎯 Générer quiz"):
-        quiz_gen = QuizGenerator(model_name="phi3:mini", questions_per_chunk=2)
-        quiz = quiz_gen.generate_quiz_from_chunks(chunks, max_chunks=3)
+    # Default PDF if none uploaded
+    if st.session_state.current_pdf is None:
+        default_pdf = Path("Data/cours_.pdf")
+        if default_pdf.exists():
+            st.session_state.current_pdf = default_pdf
+            st.info(f" Utilisation du PDF par défaut: {default_pdf.name}")
+    
+    st.markdown("---")
+    
+    # PDF Info
+    if st.session_state.current_pdf:
+        st.markdown("** Document actif:**")
+        st.text(st.session_state.current_pdf.name)
         
-        if quiz:
-            st.subheader("Quiz généré")
-            quiz_gen.display_quiz(quiz, show_answers=True)
-        else:
-            st.warning("Aucune question générée")
+        if st.button(" Supprimer", use_container_width=True):
+            st.session_state.current_pdf = None
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Mode selector
+    st.markdown("###  Mode")
+    mode = st.radio(
+        "Choisissez votre mode:",
+        [" Questions & Réponses", " Génération de Quiz"],
+        label_visibility="collapsed"
+    )
+    st.session_state.mode = mode
 
+# ==================== MAIN CONTENT ====================
+
+# Mode: Q&A
+if st.session_state.mode == " Questions & Réponses":
+    
+    # Search Bar Container
+    st.markdown('<div class="search-container">', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([8, 1])
+    
+    with col1:
+        query = st.text_input(
+            "search",
+            placeholder=" Posez votre question ici... ",
+            label_visibility="collapsed",
+            key="search_input"
+        )
+    
+    with col2:
+        search_button = st.button("🔍", use_container_width=True, type="primary")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Process query
+    if (search_button and query) or (query and st.session_state.last_query != query):
+        
+        if not st.session_state.current_pdf:
+            st.error(" Veuillez d'abord importer un PDF dans la barre latérale")
+        else:
+            st.session_state.last_query = query
+            
+            with st.spinner(" Recherche en cours..."):
+                try:
+                    answer, chunks = run_rag_pipeline(
+                        pdf_path=st.session_state.current_pdf,
+                        query=query,
+                        use_cached_index=True
+                    )
+                    
+                    # Store in history
+                    st.session_state.qa_history.append({
+                        "query": query,
+                        "answer": answer,
+                        "chunks": chunks,
+                        "timestamp": time.strftime("%H:%M:%S")
+                    })
+                    
+                except Exception as e:
+                    st.error(f" Erreur: {e}")
+    
+    # Display current answer
+    if st.session_state.qa_history:
+        latest = st.session_state.qa_history[-1]
+        
+        st.markdown("---")
+        
+        # Answer Card
+        st.markdown(f"""
+            <div class="answer-card">
+                <div class="answer-header">
+                    <span class="answer-icon">💡</span>
+                    <span class="answer-title">Réponse</span>
+                    <span class="answer-time">{latest['timestamp']}</span>
+                </div>
+                <div class="answer-content">
+                    {latest['answer']}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        # Sources (expandable)
+        with st.expander(" Sources utilisées", expanded=False):
+            for i, chunk in enumerate(latest['chunks'], 1):
+                st.markdown(f"""
+                    **Source {i}** - Section: `{chunk.get('section', 'N/A')}`
+                    
+                    {chunk['content'][:300]}...
+                    
+                    *Similarité: {chunk.get('semantic_similarity', 0):.2%}*
+                """)
+                st.markdown("---")
+    
+    # History
+    if len(st.session_state.qa_history) > 1:
+        st.markdown("---")
+        st.markdown("###  Historique des questions")
+        
+        for i, item in enumerate(reversed(st.session_state.qa_history[:-1]), 1):
+            with st.expander(f" {item['query']} - {item['timestamp']}", expanded=False):
+                st.markdown(item['answer'])
+
+# Mode: Quiz Generation
 else:
-    st.info("Veuillez uploader un fichier PDF pour commencer.")
+    display_quiz_interface()
+
+# ==================== FOOTER ====================
+st.markdown("---")
+st.markdown("""
+    <div style='text-align: center; color: #666; padding: 20px;'>
+        <small>Propulsé par Groq LLM • FAISS • Sentence Transformers</small>
+    </div>
+""", unsafe_allow_html=True)

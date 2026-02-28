@@ -1,139 +1,129 @@
 from typing import List, Dict
-from llama_index.core import VectorStoreIndex
-from llama_index.core.schema import TextNode
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 import logging
-import ollama
+import numpy as np
+from pathlib import Path
+import faiss
+import pickle
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-
-class CourseRetriever:
-    def __init__(self, model_name: str = "phi3:mini"):
-        self.model_name = model_name
-        self.embed_model = HuggingFaceEmbedding(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        self.index = None
-        self.chunks = []
-        self.course_title = ""
-        self.main_concepts = []
-
-    def index_course(self, chunks: List[Dict], course_title: str, main_concepts: List[str]):
-        self.chunks = chunks
-        self.course_title = course_title
-        self.main_concepts = main_concepts
-
-        nodes = []
-        for chunk in chunks:
-            node = TextNode(
-                text=chunk["content"],
-                metadata={
-                    "section": chunk["section"],
-                    "main_concept": chunk["main_concept"],
-                    "matched_concepts": chunk["matched_concepts"],
-                    "chunk_id": chunk["chunk_id"],
-                },
-            )
-            nodes.append(node)
-
-        self.index = VectorStoreIndex(
-            nodes=nodes,
-            embed_model=self.embed_model,
-        )
-
-        logger.info(f"Index created with {len(chunks)} chunks")
-
-    def retrieve_relevant_chunks(
+class HybridRetriever:
+    """
+    Semantic retrieval using FAISS and SentenceTransformers.
+    Optimized for CPU usage.
+    """
+    def __init__(
         self,
-        query: str,
-        top_k: int = 5,
-        use_reranking: bool = False,
-    ) -> List[Dict]:
+        embed_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        vector_dir: str = "./vector_store",
+    ):
+        self.embed_model_name = embed_model_name
+        self.vector_dir = Path(vector_dir)
+        self.vector_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize embedding model
+        logger.info(f"Loading embedding model: {embed_model_name}")
+        self.embed_model = SentenceTransformer(embed_model_name, device="cpu")
+
+        # FAISS index and metadata
+        self.index = None
+        self.metadata = []  # list of chunk metadata dicts
+        self.dimension = self.embed_model.get_sentence_embedding_dimension()
+        self.index_path = self.vector_dir / "faiss.index"
+        self.meta_path = self.vector_dir / "metadata.pkl"
+
+    def embed_texts(self, texts: List[str], batch_size: int = 8) -> np.ndarray:
+        """
+        Compute embeddings for a list of texts.
+        
+        Args:
+            texts: List of text strings to embed
+            batch_size: Batch size for encoding (smaller = less memory)
+            
+        Returns:
+            Normalized embeddings array (n_texts, dimension)
+        """
+        embeddings = self.embed_model.encode(
+            texts, 
+            batch_size=batch_size, 
+            convert_to_numpy=True, 
+            show_progress_bar=True
+        )
+        
+        # Normalize for cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / (norms + 1e-10)
+        
+        return embeddings
+
+    def build_index(self, chunks: List[Dict]):
+        """
+        Build FAISS index from chunks.
+        
+        Args:
+            chunks: List of dicts with at least {"content": str, ...}
+        """
+        logger.info(f"Building index for {len(chunks)} chunks...")
+        
+        texts = [c["content"] for c in chunks]
+        embeddings = self.embed_texts(texts)
+
+        # Build FAISS index (FlatIP = Inner Product for cosine similarity)
+        self.index = faiss.IndexFlatIP(self.dimension)
+        self.index.add(embeddings.astype(np.float32))
+        self.metadata = chunks
+
+        # Save to disk
+        self.save_index()
+        logger.info(f"FAISS index built and saved with {len(chunks)} chunks.")
+
+    def save_index(self):
+        """Save index and metadata to disk"""
+        faiss.write_index(self.index, str(self.index_path))
+        with open(self.meta_path, "wb") as f:
+            pickle.dump(self.metadata, f)
+        logger.info(f"Index saved to {self.index_path}")
+
+    def load_index(self):
+        """Load index and metadata from disk"""
+        if self.index_path.exists() and self.meta_path.exists():
+            self.index = faiss.read_index(str(self.index_path))
+            with open(self.meta_path, "rb") as f:
+                self.metadata = pickle.load(f)
+            logger.info(f"FAISS index loaded with {len(self.metadata)} chunks.")
+            return True
+        else:
+            logger.warning("No saved FAISS index found.")
+            return False
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict]:
+        """
+        Retrieve top-k most similar chunks for a query.
+        
+        Args:
+            query: Query string
+            top_k: Number of chunks to retrieve
+            
+        Returns:
+            List of chunk dicts with added 'semantic_similarity' score
+        """
         if self.index is None:
-            raise ValueError("Index not created")
+            raise ValueError("FAISS index not built or loaded. Call build_index() or load_index() first.")
 
-        retriever = self.index.as_retriever(similarity_top_k=top_k * 2)
-        nodes = retriever.retrieve(query)
+        # Embed query
+        query_emb = self.embed_texts([query])
+        
+        # Search in FAISS index
+        distances, indices = self.index.search(query_emb.astype(np.float32), top_k)
 
-        if use_reranking:
-            logger.warning("Reranking disabled due to memory constraints")
-
-        nodes = nodes[:top_k]
-
+        # Prepare results
         results = []
-        for node in nodes:
-            results.append(
-                {
-                    "content": node.node.text,
-                    "section": node.node.metadata.get("section", "Unknown"),
-                    "main_concept": node.node.metadata.get("main_concept", ""),
-                    "matched_concepts": node.node.metadata.get(
-                        "matched_concepts", []
-                    ),
-                    "chunk_id": node.node.metadata.get("chunk_id", -1),
-                    "semantic_similarity": node.score or 0.0,
-                }
-            )
+        for score, idx in zip(distances[0], indices[0]):
+            if idx < len(self.metadata):  # Valid index
+                chunk = self.metadata[idx].copy()
+                chunk["semantic_similarity"] = float(score)
+                results.append(chunk)
 
         return results
-
-    def answer_question(
-        self,
-        question: str,
-        context_size: int = 3,
-    ) -> Dict:
-        relevant_chunks = self.retrieve_relevant_chunks(
-            question,
-            top_k=context_size,
-            use_reranking=False,
-        )
-
-        combined_context = "\n\n---\n\n".join(
-            [
-                f"Section {i + 1} ({chunk['section']}):\n{chunk['content']}"
-                for i, chunk in enumerate(relevant_chunks)
-            ]
-        )
-
-        prompt = f"""Contexte extrait du document:
-{combined_context}
-
-Question: {question}
-
-Réponds de manière concise et précise en te basant uniquement sur le contexte fourni."""
-
-        try:
-            response = ollama.chat(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Tu es un assistant qui répond aux questions basées sur le contexte fourni.",
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
-                options={
-                    "temperature": 0.3,
-                    "num_predict": 300,
-                },
-            )
-
-            final_answer = response["message"]["content"]
-
-            return {
-                "answer": final_answer,
-                "confidence": 0.8,
-                "sources": relevant_chunks,
-            }
-
-        except Exception as e:
-            logger.error(f"Generation error: {e}")
-            return {
-                "answer": f"Generation error: {str(e)}",
-                "confidence": 0.0,
-                "sources": relevant_chunks,
-            }

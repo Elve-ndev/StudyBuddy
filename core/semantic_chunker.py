@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from dataclasses import dataclass
 import re
 
@@ -14,254 +14,151 @@ class SemanticChunk:
     char_start: int = 0
 
 
-class SemanticChunker:
-    def __init__(self, min_words: int = 80, max_words: int = 300, fuzzy_threshold: float = 0.6):
-        self.min_words = min_words
+class RobustPDFChunker:
+    """
+    Simple, stable and CPU-friendly chunker for technical PDFs.
+    Splits text into logical units and groups them into size-controlled chunks.
+    """
+
+    def __init__(self, max_words: int = 200, overlap: int = 30):
         self.max_words = max_words
-        self.fuzzy_threshold = fuzzy_threshold
+        self.overlap = overlap
 
-    def _fuzzy_match(self, text: str, pattern: str) -> float:
-        text_clean = re.sub(r'[^\w\s]', '', text.lower())
-        pattern_clean = re.sub(r'[^\w\s]', '', pattern.lower())
-
-        if pattern_clean in text_clean:
-            return 1.0
-
-        text_words = set(text_clean.split())
-        pattern_words = set(pattern_clean.split())
-
-        if not pattern_words:
-            return 0.0
-
-        common = len(text_words & pattern_words)
-        score = common / len(pattern_words)
-
-        return score
-
-    def _find_sections_flexible(
-        self,
-        text: str,
-        headings: List[str],
-        structure: Dict[str, List[str]]
-    ) -> Dict[str, str]:
-
-        if not headings and not structure:
-            return {"Document": text}
-
-        section_patterns = headings if headings else list(structure.keys())
-
-        sections = {}
-        lines = text.split('\n')
-
-        current_section = section_patterns[0] if section_patterns else "Introduction"
-        current_content = []
-
-        for line in lines:
-            line_stripped = line.strip()
-
-            if not line_stripped:
-                current_content.append(line)
-                continue
-
-            best_match = None
-            best_score = 0.0
-
-            for pattern in section_patterns:
-                score = self._fuzzy_match(line_stripped, pattern)
-                if score > best_score and score >= self.fuzzy_threshold:
-                    best_score = score
-                    best_match = pattern
-
-            if best_match:
-                if current_content:
-                    content_text = '\n'.join(current_content)
-                    if len(content_text.split()) >= self.min_words // 2:
-                        sections[current_section] = content_text
-
-                current_section = best_match
-                current_content = []
-            else:
-                current_content.append(line)
-
-        if current_content:
-            sections[current_section] = '\n'.join(current_content)
-
-        if not sections:
-            sections = {"Document": text}
-
-        return sections
-
+    # ---------------------------------------------------
+    # STEP 1 — Split text into logical units
+    # ---------------------------------------------------
     def _split_into_units(self, text: str) -> List[str]:
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        if paragraphs and len(paragraphs) > 1:
+        # Prefer paragraphs
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if len(paragraphs) > 1:
             return paragraphs
 
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-        if lines and len(lines) > 3:
+        # Fallback: lines
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if len(lines) > 3:
             return lines
 
+        # Fallback: sentences
         sentences = re.split(r'(?<=[.!?])\s+', text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+        return [s.strip() for s in sentences if s.strip()]
 
-        return sentences if sentences else [text]
-
-    def _chunk_section(
-        self,
-        text: str,
-        section_name: str,
-        concepts: List[str]
-    ) -> List[SemanticChunk]:
-
+    # ---------------------------------------------------
+    # STEP 2 — Group units into chunks
+    # ---------------------------------------------------
+    def _window_chunk(self, units: List[str]) -> List[List[str]]:
         chunks = []
-        units = self._split_into_units(text)
-
-        if not units:
-            return chunks
-
-        current_units = []
+        current_chunk = []
         current_word_count = 0
-        char_position = 0
 
         for unit in units:
             unit_word_count = len(unit.split())
 
-            if current_word_count + unit_word_count > self.max_words and current_units:
-                chunk = self._create_chunk(
-                    current_units, section_name, concepts, len(chunks), char_position
-                )
-                chunks.append(chunk)
+            # If adding this unit exceeds max_words → close current chunk
+            if current_word_count + unit_word_count > self.max_words and current_chunk:
+                chunks.append(current_chunk)
 
-                char_position += len('\n\n'.join(current_units))
-                current_units = [unit]
-                current_word_count = unit_word_count
-            else:
-                current_units.append(unit)
-                current_word_count += unit_word_count
+                # Overlap handling
+                if self.overlap > 0:
+                    overlap_words = 0
+                    overlap_units = []
 
-        if current_units and current_word_count >= self.min_words // 2:
-            chunk = self._create_chunk(
-                current_units, section_name, concepts, len(chunks), char_position
-            )
-            chunks.append(chunk)
+                    for u in reversed(current_chunk):
+                        overlap_words += len(u.split())
+                        overlap_units.insert(0, u)
+                        if overlap_words >= self.overlap:
+                            break
+
+                    current_chunk = overlap_units
+                    current_word_count = sum(len(u.split()) for u in current_chunk)
+                else:
+                    current_chunk = []
+                    current_word_count = 0
+
+            current_chunk.append(unit)
+            current_word_count += unit_word_count
+
+        # Add last chunk
+        if current_chunk:
+            chunks.append(current_chunk)
 
         return chunks
 
+    # ---------------------------------------------------
+    # STEP 3 — Build SemanticChunk objects
+    # ---------------------------------------------------
     def _create_chunk(
         self,
         units: List[str],
-        section_name: str,
-        concepts: List[str],
+        section: str,
         chunk_id: int,
+        concepts: List[str],
         char_start: int
     ) -> SemanticChunk:
 
-        content = '\n\n'.join(units)
+        content = "\n\n".join(units)
         word_count = len(content.split())
 
-        matched_concepts = self._find_matched_concepts(content, concepts)
-
-        main_concept = matched_concepts[0] if matched_concepts else content.split()[:5]
+        matched = [c for c in concepts if c.lower() in content.lower()]
+        main_concept = matched[0] if matched else content.split()[:5]
         if isinstance(main_concept, list):
-            main_concept = ' '.join(main_concept) + "..."
+            main_concept = " ".join(main_concept) + "..."
 
         return SemanticChunk(
             content=content,
-            section=section_name,
+            section=section,
             main_concept=main_concept,
-            matched_concepts=matched_concepts,
+            matched_concepts=matched,
             chunk_id=chunk_id,
             word_count=word_count,
             char_start=char_start
         )
 
-    def _find_matched_concepts(self, content: str, concepts: List[str]) -> List[str]:
-        matched = []
-        content_lower = content.lower()
+    # ---------------------------------------------------
+    # MAIN FUNCTION
+    # ---------------------------------------------------
+    def chunk_document(
+        self,
+        raw_text: str,
+        headings: List[str] = None,
+        structure: Dict[str, List[str]] = None,
+        concepts: List[str] = None
+    ) -> List[SemanticChunk]:
 
-        for concept in concepts:
-            if concept.lower() in content_lower:
-                matched.append(concept)
+        if not raw_text.strip():
+            return []
 
-        return matched
+        if headings is None:
+            headings = []
+        if structure is None:
+            structure = {}
+        if concepts is None:
+            concepts = []
 
-    def chunk_document(self, document_understanding) -> List[Dict]:
-        print("Debut du chunking...")
-
-        raw_text = document_understanding.raw_text
-        headings = document_understanding.detected_headings
-        structure = document_understanding.structure
-        concepts = document_understanding.main_concepts
-
-        sections = self._find_sections_flexible(raw_text, headings, structure)
-        print(f"Sections trouvees: {len(sections)}")
+        sections = {"Document": raw_text}
 
         all_chunks = []
         chunk_id = 0
 
-        for section_name, section_text in sections.items():
-            print(f"Traitement: '{section_name[:50]}...'")
+        for section_name, text in sections.items():
+            if not text.strip():
+                continue
 
-            section_chunks = self._chunk_section(section_text, section_name, concepts)
+            units = self._split_into_units(text)
+            window_chunks = self._window_chunk(units)
 
-            for chunk in section_chunks:
-                chunk.chunk_id = chunk_id
-                chunk_id += 1
+            char_pos = 0
+
+            for window in window_chunks:
+                chunk = self._create_chunk(
+                    window,
+                    section_name,
+                    chunk_id,
+                    concepts,
+                    char_pos
+                )
                 all_chunks.append(chunk)
 
-        result = [self._chunk_to_dict(chunk) for chunk in all_chunks]
+                char_pos += len("\n\n".join(window))
+                chunk_id += 1
 
-        print(f"Chunking termine: {len(result)} chunks crees")
-        return result
-
-    def _chunk_to_dict(self, chunk: SemanticChunk) -> Dict:
-        return {
-            "chunk_id": chunk.chunk_id,
-            "section": chunk.section,
-            "main_concept": chunk.main_concept,
-            "matched_concepts": chunk.matched_concepts,
-            "content": chunk.content,
-            "word_count": chunk.word_count,
-            "char_start": chunk.char_start
-        }
-
-
-if __name__ == "__main__":
-    from dataclasses import dataclass
-
-    @dataclass
-    class FakeUnderstanding:
-        raw_text: str
-        detected_headings: List[str]
-        structure: Dict[str, List[str]]
-        main_concepts: List[str]
-
-    text = """
-    COURS DE SOUDAGE
-
-    3.1. Définition
-    Le soudage est un procédé d'assemblage permanent.
-    Il permet de réunir deux pièces métalliques.
-
-    3.2. Principe du soudage
-    Le principe repose sur la fusion localisée.
-    On chauffe le métal jusqu'à fusion.
-    Un joint solide se forme au refroidissement.
-    """
-
-    understanding = FakeUnderstanding(
-        raw_text=text,
-        detected_headings=["3.1. Définition", "3.2. Principe du soudage"],
-        structure={"Définition": [], "Principe": []},
-        main_concepts=["soudage", "assemblage", "fusion", "métal"]
-    )
-
-    chunker = SemanticChunker(min_words=20, max_words=100)
-    chunks = chunker.chunk_document(understanding)
-
-    print(f"{len(chunks)} chunks crees:")
-    for chunk in chunks:
-        print(f"\nChunk {chunk['chunk_id']}:")
-        print(f"Section: {chunk['section']}")
-        print(f"Mots: {chunk['word_count']}")
-        print(f"Concepts: {', '.join(chunk['matched_concepts'])}")
-        print(f"Apercu: {chunk['content'][:80]}...")
+        return all_chunks

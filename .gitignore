@@ -1,14 +1,21 @@
-# Python
+# --- Données et fichiers générés (Lourds ou personnels) ---
+Data/quizzes/
+Data/uploads/
+Data/vector_store/
+Data/*.pdf
+Data/*.pkl
+Data/*.index
+
+# --- Python ---
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Environnements virtuels
-venv/
-env/
+*.py[cod]
+*$py.class
 .venv/
+env/
+venv/
+.env
 
-# Fichiers système
+# --- VS Code & OS ---
+.vscode/
 .DS_Store
 Thumbs.db
