@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  rag-app:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./Data:/app/Data
+      - ./vector_store:/app/vector_store
